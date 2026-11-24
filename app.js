@@ -1,9 +1,8 @@
 /* ===========================================================
    Sharabaty – app.js
    Shared by index.html (storefront) and admin.html (dashboard).
-   Data is persisted in the browser's localStorage so the demo
-   works with zero backend. See README.md for how to swap in a
-   real database and a real payment provider.
+   Products and orders live in Supabase (see SETUP-SUPABASE.md);
+   the shopping cart stays in the visitor's browser.
    =========================================================== */
 (function () {
   'use strict';
@@ -16,14 +15,13 @@
     shippingFlat: 50,           // delivery fee
     freeShippingThreshold: 600, // free delivery when subtotal >= this
     lowStockThreshold: 10,
-    adminPasscode: 'sock-admin', // DEMO ONLY – client-side check is not real security
+    // Card payments are only SIMULATED. Keep false until a real gateway is connected
+    // (also set c_cards_enabled in the SQL function place_order). See SETUP-SUPABASE.md.
+    cardPaymentsEnabled: false,
     categories: ['Everyday', 'Sport', 'Cozy', 'Dress', 'Fun'],
     sizes: ['S', 'M', 'L'],
     keys: {
-      products: 'sharabaty.products.v2', // bumped so browsers pick up the new products
-      orders: 'sharabaty.orders.v1',
-      cart: 'sharabaty.cart.v1',
-      admin: 'sharabaty.admin.session'
+      cart: 'sharabaty.cart.v1'
     }
   };
 
@@ -51,7 +49,7 @@
 
   /* ---- product photos ---- */
   const MAX_PHOTOS = 4;
-  const safeImg = (u) => typeof u === 'string' && u.startsWith('data:image/') && !/["'<>\s]/.test(u);
+  const safeImg = (u) => typeof u === 'string' && (u.startsWith('data:image/') || u.startsWith('https://')) && !/["'<>\s]/.test(u);
   const productImages = (p) => (Array.isArray(p.images) ? p.images.filter(safeImg) : []);
 
   // Small thumbnail used in the cart and admin tables: first photo, or the drawn sock.
@@ -325,57 +323,63 @@
     return { subtotal, shipping, total: subtotal + shipping };
   }
 
-  function buildSeedOrders() {
-    const byId = (id) => SEED_PRODUCTS.find((p) => p.id === id);
-    const line = (id, color, size, qty) => {
-      const p = byId(id);
-      return { productId: id, name: p.name, color, size, qty, price: p.price };
-    };
-    const daysAgo = (d, h) => new Date(Date.now() - d * 864e5 - h * 36e5).toISOString();
-    const make = (id, createdAt, customer, items, method, payStatus, status, extra) => {
-      const t = calcTotalsFor(items);
-      return Object.assign({
-        id, createdAt, customer, items,
-        subtotal: t.subtotal, shipping: t.shipping, total: t.total,
-        payment: Object.assign({ method, status: payStatus }, extra || {}),
-        status
-      }, {});
-    };
-    return [
-      make('SH-A1B2C3', daysAgo(0, 2),
-        { name: 'Nour Hassan', phone: '+20 100 555 0182', address: '14 Nile Corniche, Apt 5', city: 'Cairo', notes: 'Call before arriving' },
-        [line('p-cloud-crew', 'Midnight', 'M', 2), line('p-polka-party', 'Pink', 'S', 1)],
-        'cod', 'pending', 'pending'),
-      make('SH-D4E5F6', daysAgo(1, 5),
-        { name: 'Omar Khaled', phone: '+20 111 222 3344', address: '7 Mostafa El-Nahas St', city: 'Giza', notes: '' },
-        [line('p-fireside-wool', 'Oat', 'L', 2), line('p-cabin-fleece', 'Blush', 'M', 1), line('p-boardroom-merino', 'Charcoal', 'L', 1)],
-        'card', 'paid', 'confirmed', { last4: '4242', transactionId: 'mock_pi_seed_001' }),
-      make('SH-G7H8I9', daysAgo(3, 1),
-        { name: 'Laila Mahmoud', phone: '+20 122 987 6543', address: '32 Gamal Abdel Nasser Rd, Building B', city: 'Alexandria', notes: 'Leave with the doorman' },
-        [line('p-sprint-ankle', 'Volt', 'M', 1)],
-        'card', 'paid', 'shipped', { last4: '1881', transactionId: 'mock_pi_seed_002' }),
-      make('SH-J1K2L3', daysAgo(5, 3),
-        { name: 'Youssef Adel', phone: '+20 109 456 7788', address: '5 Tahrir Square', city: 'Cairo', notes: '' },
-        [line('p-ankle-trio', 'White', 'L', 1), line('p-sunday-stripes', 'Navy', 'M', 2)],
-        'cod', 'paid', 'delivered')
-    ];
+  /* ===================== DATA ACCESS (Supabase) ===================== */
+  const SB = window.SHARABATY_SUPABASE || {};
+  const isConfigured = !!(SB.url && SB.anonKey && !/^YOUR_/.test(SB.url) && !/^YOUR_/.test(SB.anonKey));
+  const db = isConfigured && window.supabase && window.supabase.createClient
+    ? window.supabase.createClient(SB.url, SB.anonKey)
+    : null;
+
+  // In-memory copies of what is in the database (refreshed with loadProducts / loadOrders).
+  let productsCache = [];
+  let ordersCache = [];
+  const getProducts = () => productsCache;
+  const getOrders = () => ordersCache;
+  const findProduct = (id) => productsCache.find((p) => p.id === id);
+
+  const asArray = (v) => (Array.isArray(v) ? v : []);
+
+  function errText(err) {
+    const m = (err && err.message) || '';
+    if (/failed to fetch|network|load failed/i.test(m)) return 'Network problem. Please check your connection and try again.';
+    return m || 'Something went wrong. Please try again.';
   }
 
-  function ensureSeed() {
-    if (storage.get(CONFIG.keys.products, null) === null) storage.set(CONFIG.keys.products, SEED_PRODUCTS);
-    if (storage.get(CONFIG.keys.orders, null) === null) storage.set(CONFIG.keys.orders, buildSeedOrders());
+  function rowToProduct(r) {
+    return {
+      id: r.id, name: r.name, category: r.category, price: Number(r.price) || 0, stock: Number(r.stock) || 0,
+      badge: r.badge || '', description: r.description || '', pattern: r.pattern || 'plain',
+      accent: r.accent || '#ffc93c', colors: asArray(r.colors), sizes: asArray(r.sizes), images: asArray(r.images)
+    };
+  }
+  function productToRow(p) {
+    return {
+      id: p.id, name: p.name, category: p.category, price: p.price, stock: p.stock, badge: p.badge || '',
+      description: p.description || '', pattern: p.pattern || 'plain', accent: p.accent || '#ffc93c',
+      colors: asArray(p.colors), sizes: asArray(p.sizes), images: asArray(p.images)
+    };
+  }
+  function rowToOrder(r) {
+    return {
+      id: r.id, createdAt: r.created_at, customer: r.customer || {}, items: asArray(r.items),
+      subtotal: Number(r.subtotal) || 0, shipping: Number(r.shipping) || 0, total: Number(r.total) || 0,
+      payment: r.payment || { method: 'cod', status: 'pending' }, status: r.status
+    };
   }
 
-  /* ===================== DATA ACCESS ===================== */
-  const getProducts = () => storage.get(CONFIG.keys.products, []);
-  const saveProducts = (list) => storage.set(CONFIG.keys.products, list);
-  const getOrders = () => storage.get(CONFIG.keys.orders, []);
-  const saveOrders = (list) => storage.set(CONFIG.keys.orders, list);
-  const findProduct = (id) => getProducts().find((p) => p.id === id);
-
-  function newOrderId() {
-    const rand = Math.random().toString(36).slice(2, 5).toUpperCase();
-    return 'SH-' + Date.now().toString(36).toUpperCase().slice(-4) + rand;
+  async function loadProducts() {
+    if (!db) throw new Error('The shop is not connected to its database yet (see config.js).');
+    const { data, error } = await db.from('products').select('*').order('sort_order', { ascending: true });
+    if (error) throw error;
+    productsCache = data.map(rowToProduct);
+    return productsCache;
+  }
+  async function loadOrders() {
+    if (!db) throw new Error('Not connected (see config.js).');
+    const { data, error } = await db.from('orders').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+    ordersCache = data.map(rowToOrder);
+    return ordersCache;
   }
 
   /* ===================== MODAL / LAYER HELPERS ===================== */
@@ -416,7 +420,7 @@
   }
 
   /* ===================== STOREFRONT ===================== */
-  function initStore() {
+  function initStore(loadError) {
     const state = {
       category: 'All',
       search: '',
@@ -846,20 +850,16 @@
         }
       }
 
-      const t = totals();
-      const order = {
-        id: newOrderId(),
-        createdAt: new Date().toISOString(),
-        customer: { name: f.name, phone: f.phone, address: f.address, city: f.city, notes: f.notes },
-        items: lines.map((l) => ({
-          productId: l.id, name: l.product.name, color: l.color, size: l.size, qty: l.qty, price: l.product.price
-        })),
-        subtotal: t.subtotal,
-        shipping: t.shipping,
-        total: t.total,
-        payment: { method: f.payment, status: 'pending' },
-        status: 'pending'
-      };
+      if (!db) {
+        const fe = $('#formError');
+        fe.textContent = 'The shop is not connected to its database yet. Please try again later.';
+        fe.hidden = false;
+        return;
+      }
+
+      const customer = { name: f.name, phone: f.phone, address: f.address, city: f.city, notes: f.notes };
+      const items = lines.map((l) => ({ productId: l.id, color: l.color, size: l.size, qty: l.qty }));
+      const payment = { method: f.payment };
 
       state.submitting = true;
       const btn = $('#placeOrderBtn');
@@ -868,36 +868,40 @@
 
       try {
         if (f.payment === 'card') {
-          const result = await processCardPayment(order, f.card);
+          const result = await processCardPayment({ customer, items, total: totals().total }, f.card);
           if (!result.success) {
             const fe = $('#formError');
             fe.textContent = result.error || 'Payment failed. Please try again.';
             fe.hidden = false;
             return;
           }
-          order.payment = { method: 'card', status: 'paid', last4: result.last4, transactionId: result.transactionId };
+          payment.last4 = result.last4;
+          payment.transactionId = result.transactionId;
         }
 
-        // Save order and decrement inventory.
-        const orders = getOrders();
-        orders.unshift(order);
-        if (!saveOrders(orders)) throw new Error('storage');
-        const products = getProducts();
-        order.items.forEach((it) => {
-          const p = products.find((x) => x.id === it.productId);
-          if (p) p.stock = Math.max(0, p.stock - it.qty);
+        // The server re-checks stock, recomputes prices and the delivery fee, and saves the order.
+        const { data, error } = await db.rpc('place_order', {
+          p_customer: customer, p_items: items, p_payment: payment
         });
-        saveProducts(products);
+        if (error) throw error;
 
         state.cart = [];
         persistCart();
+        try { await loadProducts(); } catch (e) { /* stock refreshes on the next visit */ }
         renderCart();
         renderProducts();
-        showConfirmation(order);
+        showConfirmation(data);
       } catch (err) {
         const fe = $('#formError');
-        fe.textContent = 'Something went wrong while saving your order. Please try again.';
+        fe.textContent = errText(err);
         fe.hidden = false;
+        try {
+          await loadProducts();
+          state.cart = loadCart();
+          renderCart();
+          renderProducts();
+          renderSummary();
+        } catch (e2) { /* ignore */ }
       } finally {
         state.submitting = false;
         btn.disabled = false;
@@ -1013,14 +1017,24 @@
       else if ($('#cartDrawer').classList.contains('open')) closeCart();
     });
 
-    // Keep tabs in sync (e.g. admin changed stock in another tab)
-    window.addEventListener('storage', (e) => {
-      if (e.key === CONFIG.keys.products) {
+    // Refresh prices and stock when the customer comes back to this tab
+    document.addEventListener('visibilitychange', async () => {
+      if (document.hidden || state.submitting) return;
+      try {
+        await loadProducts();
         state.cart = loadCart();
         renderProducts();
         renderCart();
-      }
+      } catch (e) { /* keep showing what we already have */ }
     });
+
+    // Card payments stay hidden until a real gateway is connected.
+    if (!CONFIG.cardPaymentsEnabled) {
+      const cardRadio = $('input[name="payment"][value="card"]');
+      if (cardRadio) cardRadio.closest('.pay-option').hidden = true;
+      const cod = $('input[name="payment"][value="cod"]');
+      if (cod) cod.checked = true;
+    }
 
     bindModalDismiss();
     renderHero();
@@ -1028,36 +1042,81 @@
     renderProducts();
     renderCart();
     togglePaymentUI();
+
+    if (loadError) {
+      console.error(loadError);
+      $('#emptyState').hidden = true;
+      $('#productGrid').innerHTML =
+        '<div class="empty-state" style="grid-column:1/-1"><div class="big">🔌</div>' +
+        '<h3>We couldn\'t load the socks</h3><p>Please refresh the page in a moment.</p></div>';
+    }
   }
 
   /* ===================== ADMIN ===================== */
   function initAdmin() {
     const state = { tab: 'orders' };
 
-    /* ---------- auth (demo only) ---------- */
-    const isAuthed = () => sessionStorage.getItem(CONFIG.keys.admin) === '1';
-    function showAuthState() {
-      const authed = isAuthed();
+    /* ---------- auth (Supabase Auth) ---------- */
+    async function loadAll() {
+      try {
+        await Promise.all([loadProducts(), loadOrders()]);
+        renderAll();
+      } catch (err) {
+        toast('Could not load data: ' + errText(err), 'error');
+      }
+    }
+
+    async function showAuthState(message) {
+      let authed = false;
+      let note = message || '';
+      if (db) {
+        try {
+          const { data } = await db.auth.getSession();
+          if (data && data.session) {
+            const { data: isAdm, error } = await db.rpc('is_admin');
+            authed = !error && isAdm === true;
+            if (!authed) {
+              await db.auth.signOut();
+              note = note || 'This account is not an admin.';
+            }
+          }
+        } catch (e) { /* treat as signed out */ }
+      } else {
+        note = note || 'Not connected: add your Supabase URL and key in config.js.';
+      }
       $('#loginView').hidden = authed;
       $('#dashboard').hidden = !authed;
-      if (authed) renderAll();
+      $('#loginError').textContent = authed ? '' : note;
+      if (authed) await loadAll();
     }
-    $('#demoPass').textContent = CONFIG.adminPasscode;
-    $('#loginForm').addEventListener('submit', (e) => {
+
+    $('#loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
-      if ($('#passcode').value === CONFIG.adminPasscode) {
-        sessionStorage.setItem(CONFIG.keys.admin, '1');
-        $('#loginError').textContent = '';
+      const errEl = $('#loginError');
+      errEl.textContent = '';
+      if (!db) { await showAuthState(); return; }
+      const btn = $('#loginBtn');
+      btn.disabled = true;
+      try {
+        const { error } = await db.auth.signInWithPassword({
+          email: $('#loginEmail').value.trim(),
+          password: $('#passcode').value
+        });
+        if (error) {
+          errEl.textContent = 'Incorrect email or password.';
+          $('#passcode').closest('.field').classList.add('has-error');
+          return;
+        }
         $('#passcode').value = '';
-        showAuthState();
-      } else {
-        $('#loginError').textContent = 'Incorrect passcode.';
-        $('#passcode').closest('.field').classList.add('has-error');
+        $('#passcode').closest('.field').classList.remove('has-error');
+        await showAuthState();
+      } finally {
+        btn.disabled = false;
       }
     });
-    $('#logoutBtn').addEventListener('click', () => {
-      sessionStorage.removeItem(CONFIG.keys.admin);
-      showAuthState();
+    $('#logoutBtn').addEventListener('click', async () => {
+      if (db) await db.auth.signOut();
+      await showAuthState();
     });
 
     /* ---------- labels ---------- */
@@ -1132,28 +1191,17 @@
         </tr>`).join('');
     }
 
-    function applyStock(order, sign) {
-      const products = getProducts();
-      order.items.forEach((it) => {
-        const p = products.find((x) => x.id === it.productId);
-        if (p) p.stock = Math.max(0, p.stock + sign * it.qty);
-      });
-      saveProducts(products);
-    }
-
-    function setOrderStatus(id, status) {
-      const orders = getOrders();
-      const o = orders.find((x) => x.id === id);
+    async function setOrderStatus(id, status) {
+      const o = getOrders().find((x) => x.id === id);
       if (!o || o.status === status) return;
-      const wasCancelled = o.status === 'cancelled';
-      const willCancel = status === 'cancelled';
-      if (willCancel && !wasCancelled) applyStock(o, +1);   // return items to stock
-      if (!willCancel && wasCancelled) applyStock(o, -1);   // take them out again
-      o.status = status;
-      if (status === 'delivered' && o.payment.method === 'cod') o.payment.status = 'paid';
-      saveOrders(orders);
-      toast(`Order ${id} → ${STATUS_LABELS[status]}`, 'success');
-      renderAll();
+      // The database does this in one step: it also returns the socks to stock when an order is cancelled.
+      const { error } = await db.rpc('admin_set_order_status', { p_id: id, p_status: status });
+      if (error) {
+        toast('Could not update the order: ' + errText(error), 'error');
+      } else {
+        toast(`Order ${id} → ${STATUS_LABELS[status]}`, 'success');
+      }
+      await loadAll();
     }
 
     function showOrder(id) {
@@ -1244,26 +1292,40 @@
         </tr>`).join('');
     }
 
-    function setStock(id, value) {
-      const products = getProducts();
-      const p = products.find((x) => x.id === id);
-      if (!p) return;
-      const n = Math.max(0, Math.floor(Number(value)));
-      p.stock = Number.isFinite(n) ? n : 0;
-      saveProducts(products);
+    function applyStockToUI(id, stock) {
+      const p = findProduct(id);
+      if (p) p.stock = stock;
       const row = $(`tr[data-row="${CSS.escape(id)}"]`);
       if (row) {
-        $('input', row).value = p.stock;
-        $('.stock-status', row).innerHTML = stockPill(p.stock);
+        $('input', row).value = stock;
+        $('.stock-status', row).innerHTML = stockPill(stock);
       }
       renderStats();
+    }
+
+    // "+" / "−" buttons: the database adds or subtracts, so a sale that happened
+    // while this page was open is never overwritten.
+    async function adjustStock(id, delta) {
+      const { data, error } = await db.rpc('admin_adjust_stock', { p_id: id, p_delta: delta });
+      if (error) { toast('Could not save stock: ' + errText(error), 'error'); return; }
+      applyStockToUI(id, Number(data));
+    }
+
+    // Typing an exact number in the box.
+    async function setStock(id, value) {
+      const n = Math.max(0, Math.floor(Number(value)));
+      const stock = Number.isFinite(n) ? n : 0;
+      const { error } = await db.from('products').update({ stock }).eq('id', id);
+      if (error) { toast('Could not save stock: ' + errText(error), 'error'); await loadAll(); return; }
+      applyStockToUI(id, stock);
     }
 
     /* ---------- products ---------- */
     function renderProducts() {
       const list = getProducts();
+      $('#importSeedBtn').hidden = list.length > 0;
       const body = $('#productsBody');
-      if (!list.length) { body.innerHTML = '<tr class="empty-row"><td colspan="7">No products yet. Add your first one!</td></tr>'; return; }
+      if (!list.length) { body.innerHTML = '<tr class="empty-row"><td colspan="7">No products yet. Add your first one, or import the starter socks.</td></tr>'; return; }
       body.innerHTML = list.map((p) => `
         <tr>
           <td><div class="prod-cell">
@@ -1295,14 +1357,25 @@
         (i === 0 ? '<span class="img-main">Main</span>' : '') + '</div>').join('');
     }
 
+    async function uploadPhoto(dataUrl) {
+      const blob = await (await fetch(dataUrl)).blob();
+      const path = 'p/' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8) + '.jpg';
+      const { error } = await db.storage.from('product-images').upload(path, blob, {
+        contentType: 'image/jpeg', cacheControl: '31536000'
+      });
+      if (error) throw error;
+      return db.storage.from('product-images').getPublicUrl(path).data.publicUrl;
+    }
+
     async function addPhotos(fileList) {
       const files = Array.from(fileList);
       for (const file of files) {
         if (formImages.length >= MAX_PHOTOS) { toast(`Maximum ${MAX_PHOTOS} photos per product.`, 'error'); break; }
         try {
-          formImages.push(await fileToResizedDataURL(file, 800, 0.82));
+          const dataUrl = await fileToResizedDataURL(file, 800, 0.82);
+          formImages.push(await uploadPhoto(dataUrl));
         } catch (err) {
-          toast(`${file.name}: ${err.message}`, 'error');
+          toast(`${file.name}: ${errText(err)}`, 'error');
         }
       }
       renderImagePreview();
@@ -1360,7 +1433,7 @@
       return { colors };
     }
 
-    function saveProductForm(e) {
+    async function saveProductForm(e) {
       e.preventDefault();
       const fe = $('#productFormError');
       const fail = (msg) => { fe.textContent = msg; fe.hidden = false; };
@@ -1375,7 +1448,6 @@
       const parsed = parseColors($('#pColors').value);
       if (parsed.error) return fail(parsed.error);
 
-      const products = getProducts();
       const id = $('#pId').value;
       const record = {
         id: id || 'p' + Date.now().toString(36),
@@ -1391,24 +1463,36 @@
         sizes,
         images: formImages.slice()
       };
-      const idx = products.findIndex((p) => p.id === id);
-      if (idx >= 0) products[idx] = record;
-      else products.push(record);
-      if (!saveProducts(products)) {
-        return fail('Browser storage is full. Remove a photo or upload smaller images, then try again.');
+
+      const submitBtn = $('button[type="submit"]', $('#productForm'));
+      submitBtn.disabled = true;
+      try {
+        const { error } = await db.from('products').upsert(productToRow(record));
+        if (error) return fail('Could not save: ' + errText(error));
+        closeModal('productModal');
+        toast(id ? 'Product updated' : 'Product added', 'success');
+        await loadAll();
+      } finally {
+        submitBtn.disabled = false;
       }
-      closeModal('productModal');
-      toast(idx >= 0 ? 'Product updated' : 'Product added', 'success');
-      renderAll();
     }
 
-    function deleteProduct(id) {
+    async function deleteProduct(id) {
       const p = findProduct(id);
       if (!p) return;
       if (!window.confirm(`Delete "${p.name}"? Existing orders keep their history.`)) return;
-      saveProducts(getProducts().filter((x) => x.id !== id));
+      const { error } = await db.from('products').delete().eq('id', id);
+      if (error) { toast('Could not delete: ' + errText(error), 'error'); return; }
       toast('Product deleted');
-      renderAll();
+      await loadAll();
+    }
+
+    async function importStarterProducts() {
+      if (!window.confirm(`Add the ${SEED_PRODUCTS.length} starter socks to your shop? You can edit or delete them afterwards.`)) return;
+      const { error } = await db.from('products').upsert(SEED_PRODUCTS.map(productToRow), { onConflict: 'id' });
+      if (error) { toast('Could not import: ' + errText(error), 'error'); return; }
+      toast('Starter socks added', 'success');
+      await loadAll();
     }
 
     /* ---------- tabs ---------- */
@@ -1446,7 +1530,7 @@
       const btn = e.target.closest('[data-step]');
       if (!btn) return;
       const p = findProduct(btn.dataset.id);
-      if (p) setStock(p.id, p.stock + parseInt(btn.dataset.step, 10));
+      if (p) adjustStock(p.id, parseInt(btn.dataset.step, 10));
     });
     $('#inventoryBody').addEventListener('change', (e) => {
       const input = e.target.closest('[data-stock-input]');
@@ -1472,15 +1556,8 @@
       renderImagePreview();
     });
 
-    $('#resetDataBtn').addEventListener('click', () => {
-      if (!window.confirm('Reset all products and orders back to the demo data? This cannot be undone.')) return;
-      storage.remove(CONFIG.keys.products);
-      storage.remove(CONFIG.keys.orders);
-      storage.remove(CONFIG.keys.cart);
-      ensureSeed();
-      toast('Demo data restored', 'success');
-      renderAll();
-    });
+    $('#refreshBtn').addEventListener('click', async () => { await loadAll(); toast('Refreshed', 'success'); });
+    $('#importSeedBtn').addEventListener('click', importStarterProducts);
 
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
@@ -1488,9 +1565,9 @@
       if (modal) closeModal(modal.id);
     });
 
-    // Live-update when a customer places an order in another tab
-    window.addEventListener('storage', (e) => {
-      if ((e.key === CONFIG.keys.orders || e.key === CONFIG.keys.products) && isAuthed()) renderAll();
+    // Reload when you come back to this tab, so you always see the newest orders and stock
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && !$('#dashboard').hidden) loadAll();
     });
 
     bindModalDismiss();
@@ -1499,11 +1576,15 @@
   }
 
   /* ===================== BOOT ===================== */
-  function boot() {
-    ensureSeed();
+  async function boot() {
     const page = document.body.dataset.page;
-    if (page === 'store') initStore();
-    else if (page === 'admin') initAdmin();
+    if (page === 'store') {
+      let loadError = null;
+      try { await loadProducts(); } catch (err) { loadError = err; }
+      initStore(loadError);
+    } else if (page === 'admin') {
+      initAdmin();
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
